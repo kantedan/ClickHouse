@@ -8,6 +8,7 @@
 #include <Common/Exception.h>
 #include <Common/Logger.h>
 #include <Common/ProfileEvents.h>
+#include <Common/logger_useful.h>
 
 namespace ProfileEvents
 {
@@ -27,6 +28,10 @@ namespace ErrorCodes
 
 namespace
 {
+
+/// `rd_kafka_flush` returns when the queue of the whole producer is empty, which may not happen while other `INSERT` queries
+/// use the same producer, so the wait for the messages of one `INSERT` checks them after every step.
+constexpr int FLUSH_STEP_MS = 10;
 
 /// Returns the index of a column with the given name if it exists and its type matches the `predicate`.
 template <typename TypePredicate>
@@ -52,14 +57,15 @@ bool isStringArray(const DataTypePtr & type)
 }
 
 KafkaProducer::KafkaProducer(
-    ProducerPtr producer_,
+    KafkaProducerPool & pool,
     const std::string & topic_,
     std::chrono::milliseconds poll_timeout,
     std::atomic<bool> & shutdown_called_,
     const Block & header,
     bool map_virtual_columns_on_write)
     : IMessageProducer(getLogger("KafkaProducer"))
-    , producer(producer_)
+    , producer(pool.acquire())
+    , deliveries(new KafkaDeliveryTracker)
     , topic(topic_)
     , timeout(poll_timeout)
     , shutdown_called(shutdown_called_)
@@ -72,6 +78,11 @@ KafkaProducer::KafkaProducer(
         headers_name_column_index = findSpecialColumn(header, "_headers.name", isStringArray);
         headers_value_column_index = findSpecialColumn(header, "_headers.value", isStringArray);
     }
+}
+
+KafkaProducer::~KafkaProducer()
+{
+    producer->touch();
 }
 
 void KafkaProducer::produce(const String & message, size_t rows_in_message, const Columns & columns, size_t last_row)
@@ -129,18 +140,27 @@ void KafkaProducer::produce(const String & message, size_t rows_in_message, cons
         if (shutdown_called)
             throw Exception(ErrorCodes::ABORTED, "Table is detached");
 
+        /// The producer takes the message only if `produce` does not throw.
+        builder.user_data(deliveries->messageQueued());
         try
         {
-            producer->produce(builder);
+            producer->getProducer().produce(builder);
         }
         catch (cppkafka::HandleException & e)
         {
+            deliveries->messageNotQueued();
             if (e.get_error() == RD_KAFKA_RESP_ERR__QUEUE_FULL)
             {
-                producer->poll(timeout);
+                producer->getProducer().poll(timeout);
                 continue;
             }
             ProfileEvents::increment(ProfileEvents::KafkaProducerErrors);
+            producer->invalidate();
+            throw;
+        }
+        catch (...)
+        {
+            deliveries->messageNotQueued();
             throw;
         }
         ProfileEvents::increment(ProfileEvents::KafkaMessagesProduced);
@@ -150,34 +170,33 @@ void KafkaProducer::produce(const String & message, size_t rows_in_message, cons
 
 void KafkaProducer::finish()
 {
-    // For unknown reason we may hit some internal timeout when inserting for the first time.
-    while (true)
+    if (std::exchange(finished, true))
+        return;
+
+    /// The first flush may wait for the metadata and the connection to the brokers.
+    while (deliveries->pending() > 0)
     {
-        try
-        {
-            producer->flush(timeout);
-        }
-        catch (cppkafka::HandleException & e)
-        {
-            if (e.get_error() == RD_KAFKA_RESP_ERR__TIMED_OUT)
-            {
-                if (shutdown_called)
-                    throw Exception(ErrorCodes::ABORTED, "Table is detached");
-                continue;
-            }
+        rd_kafka_flush(producer->getHandle(), FLUSH_STEP_MS);
+        if (deliveries->pending() > 0 && shutdown_called)
+            throw Exception(ErrorCodes::ABORTED, "Table is detached");
+    }
 
-            ProfileEvents::increment(ProfileEvents::KafkaProducerErrors);
-            throw;
-        }
+    ProfileEvents::increment(ProfileEvents::KafkaProducerFlushes);
 
-        ProfileEvents::increment(ProfileEvents::KafkaProducerFlushes);
-        break;
+    /// Delivery errors do not fail the `INSERT`. They are counted and logged, and the next `INSERT` gets a new producer.
+    if (const size_t failed = deliveries->failed())
+    {
+        ProfileEvents::increment(ProfileEvents::KafkaProducerErrors, failed);
+        producer->invalidate();
+        LOG_WARNING(log, "Failed to deliver {} message(s) to Kafka topic '{}': {}",
+            failed, topic, cppkafka::Error(deliveries->firstError()).to_string());
     }
 }
 
 void KafkaProducer::cancel() noexcept
 {
-    /* no op */
+    /// Does not flush or purge the producer, which may be shared with other `INSERT` queries.
+    /// The queued messages of this `INSERT` may still be delivered, and their delivery reports release `deliveries`.
 }
 
 }

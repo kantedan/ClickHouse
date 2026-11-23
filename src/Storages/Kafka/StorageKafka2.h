@@ -33,6 +33,7 @@ namespace DB
 namespace AWSMSKIAMAuth { struct OAuthBearerTokenRefreshContext; }
 
 struct KafkaSettings;
+class KafkaProducerPool;
 class Kafka2Source;
 class ReadFromStorageKafka2;
 template <typename TStorageKafka>
@@ -193,6 +194,8 @@ private:
     /// For memory accounting in the librdkafka threads.
     std::mutex thread_statuses_mutex;
     std::list<std::shared_ptr<ThreadStatus>> thread_statuses;
+    /// Declared after `thread_statuses`, which the `librdkafka` threads of a producer use until it is closed.
+    std::unique_ptr<KafkaProducerPool> producer_pool;
     /// If named_collection is specified.
     String collection_name;
 

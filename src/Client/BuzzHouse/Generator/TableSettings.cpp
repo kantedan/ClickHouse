@@ -1093,7 +1093,8 @@ static std::unordered_map<String, CHSetting> kafkaTableSettings
        {"kafka_consumer_reschedule_ms", CHSetting(highRange, {}, false)},
        {"kafka_consumers_pool_ttl_ms", CHSetting(highRange, {}, false)},
        {"kafka_flush_interval_ms", CHSetting(highRange, {}, false)},
-       {"kafka_poll_timeout_ms", CHSetting(highRange, {}, false)}};
+       {"kafka_poll_timeout_ms", CHSetting(highRange, {}, false)},
+       {"kafka_producer_idle_timeout_ms", CHSetting(highRange, {}, false)}};
 
 static std::unordered_map<String, CHSetting> rabbitMQTableSettings
     = {{"rabbitmq_empty_queue_backoff_end_ms", CHSetting(highRange, {}, false)},

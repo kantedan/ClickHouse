@@ -117,6 +117,7 @@ namespace KafkaSetting
     extern const KafkaSettingsUInt64 kafka_num_consumers;
     extern const KafkaSettingsUInt64 kafka_poll_max_batch_size;
     extern const KafkaSettingsMilliseconds kafka_poll_timeout_ms;
+    extern const KafkaSettingsMilliseconds kafka_producer_idle_timeout_ms;
     extern const KafkaSettingsString kafka_replica_name;
     extern const KafkaSettingsString kafka_schema;
     extern const KafkaSettingsUInt64 kafka_schema_registry_skip_bytes;
@@ -212,6 +213,13 @@ StorageKafka2::StorageKafka2(
         task->deactivate();
         tasks.emplace_back(std::make_shared<TaskContext>(std::move(task)));
     }
+
+    producer_pool = std::make_unique<KafkaProducerPool>(
+        [this] { return getProducerConfiguration(); },
+        std::chrono::milliseconds((*kafka_settings)[KafkaSetting::kafka_producer_idle_timeout_ms].totalMilliseconds()),
+        *getContext()->getMessageBrokerSchedulePool(),
+        getStorageID(),
+        log);
 
     if (!getContext()->getMessageQueueDisableInsertion())
     {
@@ -550,8 +558,6 @@ StorageKafka2::write(const ASTPtr &, const StorageMetadataPtr & metadata_snapsho
     if (topics.size() > 1)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Can't write to Kafka table with multiple topics");
 
-    cppkafka::Configuration conf = getProducerConfiguration();
-
     const Settings & settings = getContext()->getSettingsRef();
     size_t poll_timeout = settings[Setting::stream_poll_timeout_ms].totalMilliseconds();
     auto header = metadata_snapshot->getSampleBlockNonMaterialized();
@@ -560,9 +566,7 @@ StorageKafka2::write(const ASTPtr &, const StorageMetadataPtr & metadata_snapsho
     auto payload_split = StorageKafkaUtils::splitPayloadColumns(header, map_virtual_columns_on_write);
 
     auto producer = std::make_unique<KafkaProducer>(
-        std::make_shared<cppkafka::Producer>(conf), topics[0], std::chrono::milliseconds(poll_timeout), shutdown_called, header, map_virtual_columns_on_write);
-
-    LOG_TRACE(log, "Kafka producer created");
+        *producer_pool, topics[0], std::chrono::milliseconds(poll_timeout), shutdown_called, header, map_virtual_columns_on_write);
 
     size_t max_rows = max_rows_per_message;
     /// Need for backward compatibility.
@@ -626,6 +630,7 @@ void StorageKafka2::shutdown(bool)
     shutdown_called = true;
     /// Wake up any threads blocked in acquireConsumer waiting for a free consumer.
     cv.notify_all();
+    producer_pool->shutdown();
     activating_task->deactivate();
     partialShutdown();
     LOG_TRACE(log, "Closing consumers");

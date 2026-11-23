@@ -429,6 +429,7 @@ SETTINGS
     [kafka_max_rows_per_message = 1,]
     [kafka_compression_codec = '',]
     [kafka_compression_level = -1,]
+    [kafka_producer_idle_timeout_ms = 0,]
     [kafka_partition_shard_num = '',]
     [kafka_shard_count = 0];
 ```
@@ -477,6 +478,7 @@ Tip: different environments use different availability zone formats. Amazon MSK 
 Note: Kafka brokers must be configured with `broker.rack` and `replica.selector.class=org.apache.kafka.common.replica.RackAwareReplicaSelector`.
 - `kafka_compression_codec` — Compression codec used for producing messages. Supported: empty string, `none`, `gzip`, `snappy`, `lz4`, `zstd`. In case of empty string the compression codec is not set by the table, thus values from the config files or default value from `librdkafka` will be used. Default: empty string.
 - `kafka_compression_level` — Compression level parameter for algorithm selected by kafka_compression_codec. Higher values will result in better compression at the cost of more CPU usage. Usable range is algorithm-dependent: `[0-9]` for `gzip`; `[0-12]` for `lz4`; only `0` for `snappy`; `[0-12]` for `zstd`; `-1` = codec-dependent default compression level. Default: `-1`.
+- `kafka_producer_idle_timeout_ms` — If greater than zero, the `INSERT` queries into the table share one producer, so they do not connect to the brokers every time. The producer is closed after it has not been used for this many milliseconds, after an error, and on `DETACH` or `DROP`. Each `INSERT` waits only for its own messages. A change of the configuration, for example in a named collection, applies when the producer is created again. Default: `0`, every `INSERT` creates its own producer.
 - `kafka_map_virtual_columns_on_write` — If enabled, columns with special names `_key`, `_timestamp`, `_headers.name` and `_headers.value` in the table schema are mapped to the corresponding Kafka message metadata on `INSERT` and are excluded from the message payload. See [Mapping columns to Kafka message metadata](#mapping-columns-to-kafka-message-metadata). Default: `false`.
 - `kafka_partition_shard_num` — The current shard number for static partition-to-shard affinity. Must be between 1 and `kafka_shard_count` inclusive. Partitions are assigned by the formula `partition_id % kafka_shard_count == kafka_partition_shard_num - 1`. Supports macro expansion (e.g., `'{shard}'`). Must be used together with `kafka_shard_count`. Only supported with StorageKafka2 (requires `kafka_keeper_path` and `kafka_replica_name`). Default: `''` (disabled).
 - `kafka_shard_count` — Total number of shards participating in consumption. Used together with `kafka_partition_shard_num` to statically assign partitions. Must be used together with `kafka_partition_shard_num`. Only supported with StorageKafka2. Default: `0` (disabled).
