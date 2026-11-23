@@ -156,9 +156,16 @@ void KafkaConsumer2::initializeQueues(const cppkafka::TopicPartitionList & topic
 
     /// After a failed call `queues` may not match the consumer's assignment, so take the assignment from librdkafka.
     cppkafka::TopicPartitionList removed_partitions;
+    /// A call that threw between pausing a partition and `assign` left the paused partition assigned.
+    bool paused_partition_is_assigned = false;
     for (const auto & topic_partition : consumer->get_assignment())
-        if (!new_partitions.contains(TopicPartition{topic_partition.get_topic(), topic_partition.get_partition()}))
+    {
+        TopicPartition key{topic_partition.get_topic(), topic_partition.get_partition()};
+        if (!new_partitions.contains(key))
             removed_partitions.emplace_back(topic_partition.get_topic(), topic_partition.get_partition());
+        else if (paused_partitions.contains(key))
+            paused_partition_is_assigned = true;
+    }
 
     if (!removed_partitions.empty())
     {
@@ -207,20 +214,32 @@ void KafkaConsumer2::initializeQueues(const cppkafka::TopicPartitionList & topic
                 TopicPartition{topic_partition.get_topic(), topic_partition.get_partition()},
                 consumer->get_partition_queue(topic_partition));
 
-        consumer->assign(topic_partitions);
-
         /// Unassigning clears only librdkafka's own pause flag, so a partition we paused stays paused when it comes back.
+        /// Resume it before `assign`, while it is not assigned. After `assign` returns, librdkafka's main thread may
+        /// still be starting the partition with its own resume and `FETCH_START`. librdkafka gives every such op a
+        /// version and enqueues it in a separate step, and it drops an op whose version is older than that of the
+        /// last op it served, which `resume_partitions` does not report. So a resume after `assign` could be dropped
+        /// (the partition stays paused) or could make librdkafka drop its `FETCH_START` (the partition is not fetched).
+        /// An unassigned partition has no op in flight that our resume could race with: the ops of its removal were
+        /// enqueued before that `assign` returned, they are served in order before our resume, and librdkafka issues
+        /// no new ones until our `assign`.
         cppkafka::TopicPartitionList partitions_to_resume;
         for (const auto & topic_partition : new_partitions)
             if (paused_partitions.contains(topic_partition))
                 partitions_to_resume.emplace_back(topic_partition.topic, topic_partition.partition_id);
         if (!partitions_to_resume.empty())
         {
+            /// A paused partition that stayed assigned may still be starting, for example while librdkafka fetches its
+            /// committed offset. After `unassign` librdkafka no longer starts it.
+            if (paused_partition_is_assigned)
+                consumer->unassign();
             consumer->resume_partitions(partitions_to_resume);
             /// Forget the partitions only after the resume succeeded, so that if it throws, the next call retries it.
             for (const auto & topic_partition : partitions_to_resume)
                 paused_partitions.erase(TopicPartition{topic_partition.get_topic(), topic_partition.get_partition()});
         }
+
+        consumer->assign(topic_partitions);
     }
     catch (...)
     {
